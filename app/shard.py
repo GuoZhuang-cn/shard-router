@@ -137,11 +137,35 @@ def _split_text_by_chars(text: str, shard_tokens: int) -> list[str]:
     return hard or [text]
 
 
+def _shard_overlap(shard_tokens: int, overlap_ratio: float) -> int:
+    """重叠预算的 token 数：片大的绝对 15%，片小的至少 300 token 兜底。
+    重叠是给跨边界内容「搭手」，太小等于没搭。"""
+    return max(300, int(shard_tokens * overlap_ratio))
+
+
+def _take_tail_within(messages: list[dict[str, Any]], budget_tokens: int) -> list[dict[str, Any]]:
+    """从尾部往前取消息，总量不超过 budget_tokens。"""
+    taken: list[dict[str, Any]] = []
+    used = 0
+    for m in reversed(messages):
+        t = messages_tokens([m])
+        if taken and used + t > budget_tokens:
+            break
+        taken.append(m)
+        used += t
+        if not taken and t > budget_tokens:
+            # 单条就超预算且本来就只该有一条：照取，交给后续处理
+            break
+    taken.reverse()
+    return taken
+
+
 def split_messages(
     messages: list[dict[str, Any]],
     shard_tokens: int,
     max_shards: int,
     replicate_system: bool = True,
+    overlap_ratio: float = 0.0,
 ) -> list[Shard]:
     """把 messages 切成 N 个 Shard。
 
@@ -163,6 +187,9 @@ def split_messages(
     cur: list[dict[str, Any]] = []
     cur_tokens = prefix_tokens
 
+    # 巨型消息拆段：这些组的边界是内容级硬切，不参与消息级重叠
+    exploded_from_giant = 0
+
     for m in rest:
         mt = messages_tokens([m])
         # 单条就超预算：按内容切成多段，每段都带 role，成为独立消息
@@ -181,6 +208,7 @@ def split_messages(
                     # 由 _split_text_by_chars 的目标预算已预留的余量吸收；
                     # 真正兜底在上面的 max_shards 合并与单片超限的可视化。
                     groups.append([{"role": m["role"], "content": marker + piece}])
+                    exploded_from_giant += 1
                 continue
             # 非文本内容（如巨型 tool_calls / list content）无法安全切，单独成片
             if cur:
@@ -203,6 +231,23 @@ def split_messages(
     while len(groups) > max_shards:
         merged = groups[-2] + groups[-1]
         groups = groups[:-2] + [merged]
+
+    # ② 重叠切片：给每个相邻组之间搭「重叠带」——把前一组尾部的若干历史
+    # 消息复制到后一组头部，让跨边界的内容在两片都出现，reduce 时能对上引用。
+    # 巨型消息的内容硬切段不参与反推重叠（它们边界是字符级，取不到完整消息）。
+    if overlap_ratio > 0 and len(groups) > 1:
+        budget = _shard_overlap(shard_tokens, overlap_ratio)
+        rebuilt: list[list[dict[str, Any]]] = []
+        for i, g in enumerate(groups):
+            gg = list(g)
+            if i > 0:
+                prev = groups[i - 1]
+                # 前一组若是巨型拆段（段首带 marker），取不到完整消息，跳过
+                prev_is_giant = any("段，共" in str(m.get("content", ""))[:60] for m in prev[:1])
+                if not prev_is_giant:
+                    gg = _take_tail_within(prev, budget) + gg
+            rebuilt.append(gg)
+        groups = rebuilt
 
     shards: list[Shard] = []
     for i, g in enumerate(groups):

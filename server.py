@@ -63,11 +63,13 @@ def _build_routers(st: Settings) -> dict[str, ShardRouter]:
                 shard_tokens=int(sh.get("shard_tokens", 8000)),
                 max_shards=int(sh.get("max_shards", 10)),
                 replicate_system=bool(sh.get("replicate_system", True)),
+                overlap_ratio=float(sh.get("overlap_ratio", 0.0)),
             ),
             agg=AggSettings(
                 mode=ag.get("mode", "stream"),
                 reduce_enabled=bool(ag.get("reduce_enabled", True)),
                 reduce_model=ag.get("reduce_model"),
+                reduce_mode=ag.get("reduce_mode", "flat"),
             ),
             timeouts=st.timeouts,
         )

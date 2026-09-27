@@ -99,9 +99,32 @@
         <input type="checkbox" id="s_sys" checked style="width:auto;margin-right:6px">
         每个分片都带 system prompt（对话场景必须开）
       </label>
+      <div class="row" style="margin-top:10px">
+        <div>
+          <label>相邻分片重叠比例</label>
+          <select id="s_overlap">
+            <option value="0">0 — 硬切（省 token，跨边界可能断）</option>
+            <option value="0.10">0.10 — 轻度重叠（+10% token）</option>
+            <option value="0.15">0.15 — 推荐（+15% token，治拆完接不上）</option>
+            <option value="0.25">0.25 — 重度重叠（+25% token）</option>
+          </select>
+        </div>
+        <div>
+          <label>汇总方式</label>
+          <select id="s_rmode">
+            <option value="tree">tree — 分层两两合并（质量高，2N-2 次调用）</option>
+            <option value="flat">flat — 一次性汇总（快，1 次调用）</option>
+          </select>
+        </div>
+      </div>
+      <label>reduce 专用模型（留空=同分片模型）</label>
+      <input id="s_rmodel" placeholder="例如 glm-5.2，留空则用同一模型">
       <div class="hint">
         切片流程：估算 token → 低于阈值原样直连；超过则按「每片目标 token」把历史消息贪心分组，
-        每组复制一份 system，配一个 key 并发下发，最后 reduce 汇总。
+        每组复制一份 system，配一个 key 并发下发，最后汇总。<br>
+        <b style="color:var(--acc)">重叠</b>：把上一片尾部的历史复制到下一片头部，让跨边界内容出现两次，汇总时才接得上。<br>
+        <b style="color:var(--acc)">tree</b>：不把 9 份结论一次性糊给模型，而是两两合并、
+        逐层收敛，每次输入小、语义完整，模型能真正去重比对。
       </div>
     </div>
 
@@ -156,6 +179,9 @@ async function refresh(){
   document.getElementById('s_shard').value=sh.shard_tokens??8000;
   document.getElementById('s_max').value=sh.max_shards??10;
   document.getElementById('s_reduce').value=(d.aggregation&&d.aggregation.reduce_enabled)?'1':'0';
+  document.getElementById('s_rmode').value=(d.aggregation&&d.aggregation.reduce_mode)||'tree';
+  document.getElementById('s_rmodel').value=(d.aggregation&&d.aggregation.reduce_model)||'';
+  document.getElementById('s_overlap').value=String(sh.overlap_ratio??0.15);
   document.getElementById('s_sys').checked=(sh.replicate_system!==false);
 
   let ph='';
@@ -194,9 +220,15 @@ async function saveConfig(){
       token_threshold:+document.getElementById('s_threshold').value,
       shard_tokens:+document.getElementById('s_shard').value,
       max_shards:+document.getElementById('s_max').value,
-      replicate_system:document.getElementById('s_sys').checked
+      replicate_system:document.getElementById('s_sys').checked,
+      overlap_ratio:+document.getElementById('s_overlap').value
     },
-    aggregation:{mode:"stream",reduce_enabled:document.getElementById('s_reduce').value==='1'},
+    aggregation:{
+      mode:"stream",
+      reduce_enabled:document.getElementById('s_reduce').value==='1',
+      reduce_model:document.getElementById('s_rmodel').value.trim()||null,
+      reduce_mode:document.getElementById('s_rmode').value
+    },
     timeouts:CFG.timeouts
   }));
   const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});

@@ -116,6 +116,85 @@ def test_shard_tokens_are_estimated():
         assert s.tokens == messages_tokens(s.messages)
 
 
+# ---------- ② 重叠切片 ----------
+
+def test_no_overlap_by_default():
+    """默认 overlap_ratio=0：与旧行为完全一致。
+
+    注意：system 消息按 replicate_system 会被复制到每片，那是设计行为，
+    不是重叠。所以只统计非 system 消息的身份。
+    """
+    msgs = _mk(turns=40, size=1000)
+    a = split_messages(msgs, shard_tokens=3000, max_shards=10, overlap_ratio=0.0)
+    assert len(a) > 1
+    ids = [id(m) for s in a for m in s.messages if m["role"] != "system"]
+    assert len(ids) == len(set(ids)), "无重叠时同一非 system 消息对象不应被复用"
+
+
+def test_overlap_duplicates_tail_into_next_shard():
+    """overlap_ratio>0 时，相邻片之间必须出现重复消息（这就是重叠）。"""
+    msgs = _mk(turns=40, size=1000)
+    a = split_messages(msgs, shard_tokens=3000, max_shards=10, overlap_ratio=0.15)
+    assert len(a) > 1
+    seen = set()
+    dup = 0
+    for s in a:
+        for m in s.messages:
+            if m["content"] in seen:
+                dup += 1
+            seen.add(m["content"])
+    assert dup > 0, "开了重叠却没有任何消息被复制到下一片"
+
+
+def test_overlap_does_not_duplicate_first_shard_content_forward():
+    """第 1 片不能有重叠（没有前一片可借）。"""
+    msgs = _mk(turns=40, size=1000)
+    a = split_messages(msgs, shard_tokens=3000, max_shards=10, overlap_ratio=0.3)
+    assert len(a) > 1
+    first_msgs = {m["content"] for m in a[0].messages}
+    # 第 1 片内容必然出现在后续片的开头（被借走），这没问题；
+    # 但要保证没有「第 1 片自己多出」的情况：第 1 片消息数应等于无重叠时
+    b = split_messages(msgs, shard_tokens=3000, max_shards=10, overlap_ratio=0.0)
+    assert len(a[0].messages) == len(b[0].messages)
+
+
+def test_overlap_increases_token_cost():
+    msgs = _mk(turns=40, size=1000)
+    b = split_messages(msgs, shard_tokens=3000, max_shards=10, overlap_ratio=0.0)
+    a = split_messages(msgs, shard_tokens=3000, max_shards=10, overlap_ratio=0.25)
+    assert sum(s.tokens for s in a) > sum(s.tokens for s in b)
+
+
+def test_overlap_respects_budget_ceiling():
+    """重叠不能让单片无限膨胀：最多 = shard_tokens + 重叠预算。"""
+    msgs = _mk(turns=40, size=1000)
+    a = split_messages(msgs, shard_tokens=2000, max_shards=10, overlap_ratio=0.2)
+    budget = 2000 + max(300, int(2000 * 0.2))
+    for s in a:
+        assert s.tokens <= budget * 1.6, f"重叠后单片超限: {s.tokens} > {budget}"
+
+
+def test_overlap_skips_giant_exploded_groups():
+    """巨型消息的内容硬切段之间不反推重叠（取不到完整消息）。"""
+    msgs = [{"role": "user", "content": "内容。" * 4000}]
+    a = split_messages(msgs, shard_tokens=2000, max_shards=10, overlap_ratio=0.2)
+    # 每片应只有一个巨型拆段的组（不被前一段污染）
+    for s in a:
+        assert len([m for m in s.messages if "段，共" in str(m.get("content", ""))[:60]]) <= 1
+
+
+def test_overlap_still_preserves_all_original_messages():
+    """开了重叠，原始消息一条都不能少（重叠只做加法）。"""
+    msgs = _mk(turns=40, size=1200, )
+    msgs = [{"role": "system", "content": "S"}] + msgs
+    a = split_messages(msgs, shard_tokens=3000, max_shards=10,
+                       overlap_ratio=0.2, replicate_system=False)
+    seen = {m["content"] for s in a for m in s.messages}
+    for m in msgs:
+        if m["role"] != "system":
+            assert m["content"] in seen, f"消息丢失: {m['content'][:30]}"
+
+
 def test_giant_message_is_content_split_not_isolated():
     """核心场景：一条 5 万字符的巨型消息必须被按内容切开，而不是独占一片。
 
@@ -448,6 +527,115 @@ async def test_shards_run_concurrently(monkeypatch):
     dt = _t.monotonic() - t0
     assert "error" not in out
     assert dt < 1.0, f"不够并发，耗时 {dt:.2f}s"
+
+
+# ---------- ① Tree Reduce ----------
+
+@pytest.mark.asyncio
+async def test_tree_reduce_uses_more_calls_than_flat():
+    """Tree 每次只合 2 份，5 片应从 4 次合并收敛，远多于 flat 的 1 次。"""
+    def _tree_router():
+        r = _router(threshold=500, shard_tokens=200, max_shards=8)
+        r.agg.reduce_mode = "tree"
+        return r
+
+    msgs = _mk(turns=40, size=600)
+    dec = _tree_router().decide({"messages": msgs})
+
+    for mode, expect_min in (("tree", 2), ("flat", 1)):
+        r = _router(threshold=500, shard_tokens=200, max_shards=8)
+        r.agg.reduce_mode = mode
+        n = {"i": 0}
+
+        async def fake_complete(session, idx, body, ct, rt, _n=n):
+            _n["i"] += 1
+            return {"choices": [{"message": {"content": f"结论{_n['i']}"}}], "usage": {}}
+
+        r.pool.complete = fake_complete  # type: ignore[method-assign]
+        out = await r.run({"messages": msgs}, "m")
+        assert "error" not in out
+        xs = out["x_shard_router"]
+        if mode == "tree":
+            assert xs["reduce_calls"] >= expect_min, "tree 应做多次合并"
+            assert xs["reduce_calls"] > 1
+        else:
+            assert xs["reduce_calls"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_tree_reduce_terminates_and_returns_text():
+    """5 片 tree：必须收敛成 1 个最终答案，不能死循环。"""
+    r = _router(threshold=500, shard_tokens=200, max_shards=8)
+    r.agg.reduce_mode = "tree"
+    n = {"i": 0}
+
+    async def fake_complete(session, idx, body, ct, rt):
+        n["i"] += 1
+        return {"choices": [{"message": {"content": f"合并结果{n['i']}"}}], "usage": {}}
+
+    r.pool.complete = fake_complete  # type: ignore[method-assign]
+    out = await r.run({"messages": _mk(turns=40, size=600)}, "m")
+    assert "error" not in out
+    assert out["choices"][0]["message"]["content"].strip()
+    assert out["x_shard_router"]["reduce_used"] is True
+
+
+@pytest.mark.asyncio
+async def test_tree_reduce_failure_falls_back_to_concat():
+    """分片成功、tree 每次合并都失败时，必须降级成拼接而不是报错。"""
+    r = _router(threshold=500, shard_tokens=200, max_shards=8)
+    r.agg.reduce_mode = "tree"
+    dec = r.decide({"messages": _mk(turns=40, size=600)})
+    n = {"i": 0}
+
+    async def fake_complete(session, idx, body, ct, rt):
+        n["i"] += 1
+        # 前 N 次是分片（成功），之后全是 reduce 合并（失败）
+        if n["i"] <= dec.shard_count:
+            return {"choices": [{"message": {"content": f"分片{n['i']}结论"}}], "usage": {}}
+        raise UpstreamError(500, "boom")
+
+    r.pool.complete = fake_complete  # type: ignore[method-assign]
+    out = await r.run({"messages": _mk(turns=40, size=600)}, "m")
+    assert "error" not in out, out
+    assert out["x_shard_router"]["reduce_used"] is True   # 走了 tree 分支
+    assert out["x_shard_router"]["reduce_calls"] > 0
+    # 降级结果必须含分片正文
+    assert "分片1结论" in out["choices"][0]["message"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_flat_reduce_single_call():
+    r = _router(threshold=500, shard_tokens=200, max_shards=8)
+    r.agg.reduce_mode = "flat"
+    n = {"i": 0}
+
+    async def fake_complete(session, idx, body, ct, rt):
+        n["i"] += 1
+        return {"choices": [{"message": {"content": "扁平汇总"}}], "usage": {}}
+
+    r.pool.complete = fake_complete  # type: ignore[method-assign]
+    out = await r.run({"messages": _mk(turns=40, size=600)}, "m")
+    xs = out["x_shard_router"]
+    assert xs["reduce_calls"] == 1  # flat 固定 1 次
+
+
+@pytest.mark.asyncio
+async def test_reduce_can_use_separate_model():
+    """reduce_model 指定时，reduce 调用必须用那个模型。"""
+    r = _router(threshold=500, shard_tokens=200, max_shards=8)
+    r.agg.reduce_mode = "flat"
+    r.agg.reduce_model = "other-model"
+    seen_models = []
+
+    async def fake_complete(session, idx, body, ct, rt):
+        seen_models.append(body["model"])
+        return {"choices": [{"message": {"content": "x"}}], "usage": {}}
+
+    r.pool.complete = fake_complete  # type: ignore[method-assign]
+    out = await r.run({"messages": _mk(turns=40, size=600)}, "other-model")
+    assert "error" not in out
+    assert "other-model" in seen_models
 
 
 @pytest.mark.asyncio

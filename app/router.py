@@ -53,6 +53,8 @@ class ShardSettings:
     shard_tokens: int = 8000
     max_shards: int = 10
     replicate_system: bool = True
+    # 相邻分片的重叠比例：0=硬切，0.15=每片回退 15%（至少 300 token）
+    overlap_ratio: float = 0.0
 
 
 @dataclass
@@ -60,6 +62,8 @@ class AggSettings:
     mode: str = "stream"
     reduce_enabled: bool = True
     reduce_model: str | None = None
+    # flat = N 份一次性汇总（1 次调用）；tree = 分层两两合并（2N-2 次，层内并发）
+    reduce_mode: str = "flat"
 
 
 def _extract_text(data: dict[str, Any]) -> str:
@@ -118,6 +122,7 @@ class ShardRouter:
             shard_tokens=self.settings.shard_tokens,
             max_shards=self.settings.max_shards,
             replicate_system=self.settings.replicate_system,
+            overlap_ratio=self.settings.overlap_ratio,
         )
         if len(shards) <= 1:
             return RouteDecision(False, "single_shard", est, 1, shards[0].to_dict() and [shards[0].to_dict()])
@@ -190,6 +195,7 @@ class ShardRouter:
             shard_tokens=self.settings.shard_tokens,
             max_shards=self.settings.max_shards,
             replicate_system=self.settings.replicate_system,
+            overlap_ratio=self.settings.overlap_ratio,
         )
         t0 = time.monotonic()
         results = await asyncio.gather(
@@ -204,26 +210,38 @@ class ShardRouter:
                 model, dec, list(results),
             )
 
-        final_text, reduce_used = await self._reduce(ok_results, payload, model)
+        final_text, reduce_used, reduce_calls = await self._reduce(ok_results, payload, model)
         merged = ShardResult(
             0, True, text=final_text,
             tokens=sum(r.tokens for r in ok_results),
             latency=round(parallel_time, 2),
         )
         merged.reduce_used = reduce_used  # type: ignore[attr-defined]
+        merged.reduce_calls = reduce_calls  # type: ignore[attr-defined]
         return self._to_openai(merged, model, dec, list(results))
 
     async def _reduce(
         self, results: list[ShardResult], payload: dict[str, Any], model: str
-    ) -> tuple[str, bool]:
-        """把 N 份分片结果合成最终答案。"""
-        parts = [f"【分片 {r.index + 1} 结论】\n{r.text.strip()}" for r in results]
+    ) -> tuple[str, bool, int]:
+        """把 N 份分片结果合成最终答案。
+
+        策略由 `aggregation.reduce_mode` 决定：
+        - `flat`（默认）：N 份结论一次性塞给 reduce。
+        - `tree`：分层两两合并——每层并发做若干次小合并，直到剩 1 份。
+          Tree 每次输入小、语义完整，模型能真正去重比对，而不是被
+          12,000 字结论糊一脸。代价是调用次数变成 2N-2 次，
+          但这些调用本来就要用 key 池消化，且每层内是并发的。
+
+        返回 (最终文本, 是否用了模型汇总, reduce 调用次数)。
+        """
+        parts = [r.text.strip() for r in results if r.text.strip()]
+        if not parts:
+            return "", False, 0
         if len(parts) == 1:
-            return parts[0], False
-        joined = "\n\n".join(parts)
+            return parts[0], False, 0
 
         if not self.agg.reduce_enabled:
-            return joined, False
+            return "\n\n".join(f"【分片 {i + 1} 结论】\n{p}" for i, p in enumerate(parts)), False, 0
 
         original_q = ""
         for m in reversed(payload.get("messages") or []):
@@ -232,19 +250,30 @@ class ShardRouter:
                 original_q = c if isinstance(c, str) else str(c)
                 break
 
-        reduce_prompt = (
-            "下面是同一长上下文被切分成多个片段后，各片段的独立分析结论。"
-            "请把它们整合成对原始问题的完整、连贯、无重复的最终回答。"
-            "不要出现「分片」字样，不要罗列中间过程，只给最终答案。\n\n"
-            f"【原始问题】\n{original_q[:4000]}\n\n"
-            f"【各分片结论】\n{joined[:12000]}"
-        )
         rmodel = self.agg.reduce_model or model
+        mode = (self.agg.reduce_mode or "flat").lower()
+
+        if mode == "tree":
+            return await self._tree_reduce(parts, original_q, payload, rmodel)
+        return await self._flat_reduce(parts, original_q, payload, rmodel)
+
+    async def _reduce_call(
+        self, a: str, b: str, original_q: str, payload: dict[str, Any], rmodel: str
+    ) -> str | None:
+        """单次 reduce 调用。失败返回 None（由调用方决定降级）。"""
+        prompt = (
+            "下面是对同一长上下文不同片段的两份独立分析结论。"
+            "请把它们整合成一份更完整、连贯、无重复的结论。"
+            "不要出现「分片」或「结论」字样，不要罗列过程，只给合并后的正文。\n\n"
+            f"【原始问题】\n{original_q[:3000]}\n\n"
+            f"【片段A结论】\n{a[:6000]}\n\n"
+            f"【片段B结论】\n{b[:6000]}"
+        )
         body = {
             "model": rmodel,
             "messages": [
-                {"role": "system", "content": "你是结果整合器，负责合并多份分析结论。"},
-                {"role": "user", "content": reduce_prompt},
+                {"role": "system", "content": "你是结果整合器，负责合并两份分析结论。"},
+                {"role": "user", "content": prompt},
             ],
             "temperature": payload.get("temperature"),
             "max_tokens": payload.get("max_tokens"),
@@ -253,17 +282,82 @@ class ShardRouter:
         body = {k: v for k, v in body.items() if v is not None}
         got = self.pool.acquire()
         if got is None:
-            return joined, False
-        idx, st = got
+            return None
+        idx, _st = got
         try:
             data = await self.pool.complete(
                 self._session, idx, body,
                 self.timeouts.get("connect", 15), self.timeouts.get("read", 120),
             )
-            return _extract_text(data) or joined, True
+            return _extract_text(data) or None
         except Exception:  # noqa: BLE001
-            # reduce 失败不致命：退回拼接结果
-            return joined, False
+            return None
+
+    async def _tree_reduce(
+        self, parts: list[str], original_q: str, payload: dict[str, Any], rmodel: str
+    ) -> tuple[str, bool, int]:
+        """分层两两合并。每层内部并发，层与层之间串行。"""
+        level = list(parts)
+        calls = 0
+        while len(level) > 1:
+            pairs = [(level[i], level[i + 1]) for i in range(0, len(level) - 1, 2)]
+            odd = level[-1] if len(level) % 2 else None
+            merged = await asyncio.gather(
+                *[self._reduce_call(a, b, original_q, payload, rmodel) for a, b in pairs]
+            )
+            calls += len(pairs)
+            # 合并失败的降级成拼接，保证层数一定收敛
+            nxt: list[str] = []
+            for (a, b), m in zip(pairs, merged):
+                nxt.append(m if m else f"{a}\n\n{b}")
+            if odd is not None:
+                nxt.append(odd)
+            level = nxt
+        return (level[0] if level else ""), True, calls
+
+    async def _flat_reduce(
+        self, parts: list[str], original_q: str, payload: dict[str, Any], rmodel: str
+    ) -> tuple[str, bool, int]:
+        """一次调用的扁平汇总。"""
+        joined = "\n\n".join(f"【分片 {i + 1} 结论】\n{p}" for i, p in enumerate(parts))
+        final = await self._reduce_call_flat(joined, original_q, payload, rmodel)
+        if final:
+            return final, True, 1
+        return joined, False, 0
+
+    async def _reduce_call_flat(
+        self, joined: str, original_q: str, payload: dict[str, Any], rmodel: str
+    ) -> str | None:
+        prompt = (
+            "下面是同一长上下文被切分成多个片段后，各片段的独立分析结论。"
+            "请把它们整合成对原始问题的完整、连贯、无重复的最终回答。"
+            "不要出现「分片」字样，不要罗列中间过程，只给最终答案。\n\n"
+            f"【原始问题】\n{original_q[:4000]}\n\n"
+            f"【各分片结论】\n{joined[:12000]}"
+        )
+        body = {
+            "model": rmodel,
+            "messages": [
+                {"role": "system", "content": "你是结果整合器，负责合并多份分析结论。"},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": payload.get("temperature"),
+            "max_tokens": payload.get("max_tokens"),
+            "stream": False,
+        }
+        body = {k: v for k, v in body.items() if v is not None}
+        got = self.pool.acquire()
+        if got is None:
+            return None
+        idx, _st = got
+        try:
+            data = await self.pool.complete(
+                self._session, idx, body,
+                self.timeouts.get("connect", 15), self.timeouts.get("read", 120),
+            )
+            return _extract_text(data) or None
+        except Exception:  # noqa: BLE001
+            return None
 
     def _to_openai(
         self, res: ShardResult, model: str, dec: RouteDecision, all_results: list[ShardResult]
@@ -301,6 +395,7 @@ class ShardRouter:
                 "shard_count": dec.shard_count,
                 "shards": dec.shards,
                 "reduce_used": getattr(res, "reduce_used", False),
+                "reduce_calls": getattr(res, "reduce_calls", 0),
                 "latency_s": res.latency,
                 "per_shard": [
                     {
