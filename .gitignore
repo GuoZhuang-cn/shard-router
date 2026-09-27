@@ -1,0 +1,19 @@
+# 密钥与本地配置（keys 一律走环境文件 /etc/shard-router/keys.env）
+*.env
+keys.env
+.venv/
+__pycache__/
+*.pyc
+
+# 运行时数据
+logs/
+*.log
+*.sqlite
+*.db
+
+# 本地覆盖配置
+config.local.yaml
+
+.DS_Store
+.idea/
+.vscode/

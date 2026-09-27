@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>shard-router</title>
+<style>
+  :root{
+    --bg:#0b0f16; --panel:#131a26; --panel2:#0f151f; --line:#222d3d;
+    --txt:#e6edf5; --dim:#8b9bb0; --acc:#4da3ff; --ok:#2ecc71; --warn:#f5a623; --err:#ff5c5c;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font:14px/1.55 -apple-system,"Segoe UI",Roboto,"Helvetica Neue","PingFang SC","Microsoft YaHei",sans-serif}
+  header{display:flex;align-items:center;gap:12px;padding:14px 22px;background:var(--panel);
+    border-bottom:1px solid var(--line);position:sticky;top:0;z-index:9}
+  header h1{font-size:16px;margin:0;font-weight:600}
+  header .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok)}
+  header .sp{flex:1}
+  header button{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:7px 14px;cursor:pointer;font-size:13px}
+  header button.ghost{background:transparent;border:1px solid var(--line);color:var(--dim)}
+  main{padding:22px;max-width:1200px;margin:0 auto;display:grid;gap:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+  .card h2{margin:0 0 12px;font-size:14px;font-weight:600;color:var(--dim);letter-spacing:.4px}
+  .grid{display:grid;gap:18px;grid-template-columns:1fr 1fr}
+  @media(max-width:900px){.grid{grid-template-columns:1fr}}
+  label{display:block;font-size:12px;color:var(--dim);margin:10px 0 4px}
+  input,select,textarea{width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--txt);
+    border-radius:6px;padding:8px 10px;font:inherit}
+  textarea{min-height:90px;resize:vertical;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+  input:focus,select:focus,textarea:focus{outline:0;border-color:var(--acc)}
+  .row{display:flex;gap:10px;align-items:center}
+  .row>*{flex:1}
+  .keys{display:grid;gap:6px;margin-top:6px}
+  .key{display:flex;align-items:center;gap:8px;font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace;
+    background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:6px 10px}
+  .key .st{width:7px;height:7px;border-radius:50%;background:var(--ok)}
+  .key.cool .st{background:var(--err)}
+  .key .n{color:var(--dim);margin-left:auto;font-size:11px}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+  th{color:var(--dim);font-weight:500}
+  .pill{display:inline-block;padding:1px 8px;border-radius:99px;font-size:11px}
+  .pill.ok{background:rgba(46,204,113,.15);color:var(--ok)}
+  .pill.no{background:rgba(255,92,92,.15);color:var(--err)}
+  .stat{display:flex;gap:18px;flex-wrap:wrap}
+  .stat div{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px 16px;min-width:96px}
+  .stat b{display:block;font-size:20px;font-weight:600}
+  .stat span{font-size:11px;color:var(--dim)}
+  #out{background:#060a10;border:1px solid var(--line);border-radius:6px;padding:10px;font-size:12px;
+    font-family:ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-all;max-height:320px;overflow:auto}
+  .hint{font-size:11px;color:var(--dim);margin-top:6px;line-height:1.6}
+  .bar{height:5px;background:var(--line);border-radius:99px;overflow:hidden;margin-top:6px}
+  .bar i{display:block;height:100%;background:var(--acc)}
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>shard-router</h1>
+  <span class="sp"></span>
+  <button class="ghost" onclick="refresh()">刷新</button>
+  <button onclick="saveConfig()">保存配置</button>
+</header>
+
+<main>
+  <div class="card">
+    <h2>运行状态</h2>
+    <div class="stat" id="stats"></div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>切片策略</h2>
+      <div class="row">
+        <div>
+          <label>触发阈值 token（超过才切片）</label>
+          <input id="s_threshold" type="number" value="12000">
+        </div>
+        <div>
+          <label>每片目标 token</label>
+          <input id="s_shard" type="number" value="8000">
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>最大并发片数</label>
+          <input id="s_max" type="number" value="10">
+        </div>
+        <div>
+          <label>reduce 阶段（调模型汇总）</label>
+          <select id="s_reduce">
+            <option value="1">启用（质量优先）</option>
+            <option value="0">关闭（速度优先，直接拼接）</option>
+          </select>
+        </div>
+      </div>
+      <label style="margin-top:10px">
+        <input type="checkbox" id="s_sys" checked style="width:auto;margin-right:6px">
+        每个分片都带 system prompt（对话场景必须开）
+      </label>
+      <div class="hint">
+        切片流程：估算 token → 低于阈值原样直连；超过则按「每片目标 token」把历史消息贪心分组，
+        每组复制一份 system，配一个 key 并发下发，最后 reduce 汇总。
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Providers</h2>
+      <div id="providers"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>连通性测试</h2>
+    <div class="row">
+      <select id="t_provider"></select>
+      <input id="t_model" placeholder="模型名，如 kimi-k3">
+    </div>
+    <label>测试 prompt</label>
+    <textarea id="t_prompt">你好，请做个自我介绍，100字以内。</textarea>
+    <div class="row" style="margin-top:10px">
+      <button class="ghost" style="flex:0 0 auto;padding:8px 16px" onclick="runTest()">发送测试</button>
+    </div>
+    <label>结果</label>
+    <div id="out">（等待测试）</div>
+  </div>
+
+  <div class="card">
+    <h2>接入方式</h2>
+    <div class="hint" style="font-size:12px">
+      在 9router 里新增一个 OpenAI 兼容 provider，base_url 填
+      <b style="color:var(--acc)">http://172.17.0.1:20200/v1</b>，API key 任意非空字符串，
+      然后把模型加进你要用的 combo 即可。<br>
+      请求小于阈值时完全透传（零损耗）；超过阈值时自动切片 + 多 key 并发 + 汇总。
+    </div>
+  </div>
+</main>
+
+<script>
+let CFG=null;
+
+async function refresh(){
+  const r=await fetch('/api/status'); const d=await r.json(); CFG=d;
+  const s=d.stats||{};
+  const up=Math.round((s.uptime!==undefined?s.uptime:0));
+  document.getElementById('stats').innerHTML=`
+    <div><b>${s.requests||0}</b><span>总请求</span></div>
+    <div><b>${s.sharded||0}</b><span>触发切片</span></div>
+    <div><b style="color:var(--ok)">${s.ok||0}</b><span>成功</span></div>
+    <div><b style="color:var(--err)">${s.failed||0}</b><span>失败</span></div>
+    <div><b>${up}s</b><span>运行时长</span></div>`;
+
+  const sh=d.sharding||{};
+  document.getElementById('s_threshold').value=sh.token_threshold??12000;
+  document.getElementById('s_shard').value=sh.shard_tokens??8000;
+  document.getElementById('s_max').value=sh.max_shards??10;
+  document.getElementById('s_reduce').value=(d.aggregation&&d.aggregation.reduce_enabled)?'1':'0';
+  document.getElementById('s_sys').checked=(sh.replicate_system!==false);
+
+  let ph='';
+  for(const [name,p] of Object.entries(d.providers||{})){
+    const pct=p.key_count?Math.round(p.available/p.key_count*100):0;
+    ph+=`<div style="margin-bottom:14px">
+      <div class="row" style="flex:0 0 auto">
+        <b>${p.name||name}</b>
+        <span class="pill ${p.available?'ok':'no'}">${p.available}/${p.key_count} 可用</span>
+      </div>
+      <div class="hint" style="margin:2px 0 4px">${p.base_url}</div>
+      <div class="bar"><i style="width:${pct}%"></i></div>
+      <div class="keys">`+
+      (p.keys||[]).map(k=>`<div class="key ${k.cooling?'cool':''}">
+        <span class="st"></span>...${k.key_tail}
+        <span class="n">ok ${k.ok} · fail ${k.fail}${k.cooling?' · 冷却 '+k.cooldown_left+'s':''}</span>
+      </div>`).join('')+
+      `</div></div>`;
+  }
+  document.getElementById('providers').innerHTML=ph||'<div class="hint">未配置 provider</div>';
+
+  const sel=document.getElementById('t_provider');
+  const names=Object.keys(d.providers||{});
+  if(sel.options.length!==names.length){
+    sel.innerHTML=names.map(n=>`<option>${n}</option>`).join('');
+  }
+  if(names.length) document.getElementById('t_model').placeholder='模型名，如 '+(d.providers[names[0]].models[0]||'model');
+}
+
+async function saveConfig(){
+  if(!CFG) await refresh();
+  const body=JSON.parse(JSON.stringify({
+    server:CFG.server||{host:"0.0.0.0",port:20200},
+    providers:CFG.providers_raw||{},
+    sharding:{
+      token_threshold:+document.getElementById('s_threshold').value,
+      shard_tokens:+document.getElementById('s_shard').value,
+      max_shards:+document.getElementById('s_max').value,
+      replicate_system:document.getElementById('s_sys').checked
+    },
+    aggregation:{mode:"stream",reduce_enabled:document.getElementById('s_reduce').value==='1'},
+    timeouts:CFG.timeouts
+  }));
+  const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const d=await r.json();
+  document.getElementById('out').textContent=(d.ok?'✅ ':'❌ ')+d.message;
+  refresh();
+}
+
+async function runTest(){
+  const out=document.getElementById('out');
+  out.textContent='发送中…';
+  const body={
+    provider:document.getElementById('t_provider').value,
+    model:document.getElementById('t_model').value,
+    prompt:document.getElementById('t_prompt').value
+  };
+  const t0=Date.now();
+  try{
+    const r=await fetch('/api/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json();
+    const dt=((Date.now()-t0)/1000).toFixed(1);
+    out.textContent=`耗时 ${dt}s\n切片: ${d.sharded} · 估算token: ${d.est_tokens}\n\n`+
+      (d.ok? d.reply : ('❌ '+(d.message||d.error)));
+  }catch(e){ out.textContent='❌ '+e; }
+}
+
+refresh();
+setInterval(refresh,5000);
+</script>
+</body>
+</html>

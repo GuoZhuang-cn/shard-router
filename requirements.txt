@@ -1,0 +1,7 @@
+fastapi>=0.110
+uvicorn>=0.27
+aiohttp>=3.9
+PyYAML>=6.0
+# 测试用
+pytest>=8.0
+pytest-asyncio>=0.23
