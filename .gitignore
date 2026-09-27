@@ -17,3 +17,8 @@ config.local.yaml
 .DS_Store
 .idea/
 .vscode/
+
+# 含 provider keys 的本地配置（绝不入库）
+config.yaml
+config.yaml.bak-*
+*.bak-*
