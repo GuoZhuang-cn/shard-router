@@ -131,6 +131,19 @@
     <div class="card">
       <h2>Providers</h2>
       <div id="providers"></div>
+      <hr style="border:0;border-top:1px solid var(--line);margin:16px 0">
+      <label>编辑 Provider 的 API Keys（每行一个）</label>
+      <div class="row">
+        <select id="k_provider" onchange="loadKeysIntoEditor()"></select>
+        <button class="ghost" style="flex:0 0 auto;padding:8px 16px" onclick="saveKeys()">保存 Keys</button>
+      </div>
+      <textarea id="k_keys" placeholder="每行一个 API key，例如：&#10;sk-xxxxxxxx&#10;sk-yyyyyyyy" spellcheck="false"></textarea>
+      <div class="hint" id="k_info"></div>
+      <div class="hint" style="color:var(--warn)">
+        key 只写入本机 <b>/opt/shard-router/config.yaml</b>（权限 600，且已被 .gitignore 排除）。
+        保存后立即热加载，无需重启。若配置里用的是 keys_env（读环境变量），
+        这里保存会改为直接写入配置文件。
+      </div>
     </div>
   </div>
 
@@ -208,7 +221,60 @@ async function refresh(){
   if(sel.options.length!==names.length){
     sel.innerHTML=names.map(n=>`<option>${n}</option>`).join('');
   }
+
+  // provider 下拉框（key 编辑器）
+  const ksel=document.getElementById('k_provider');
+  if(ksel.options.length!==names.length){
+    ksel.innerHTML=names.map(n=>`<option>${n}</option>`).join('');
+  }
+  const cur=(d.providers_raw||{})[ksel.value]||{};
+  document.getElementById('k_info').innerHTML=
+    `base_url: <b>${cur.base_url||'-'}</b> · 已配 ${d.providers[ksel.value]?.key_count||0} 个 key`+
+    (cur.keys_env?` · 当前从环境变量 <b>${cur.keys_env}</b> 读取`:' · 当前从配置文件读取');
+
   if(names.length) document.getElementById('t_model').placeholder='模型名，如 '+(d.providers[names[0]].models[0]||'model');
+}
+
+// key 不回显到浏览器（/api/status 只给尾号）。所以编辑框是「替换语义」：
+// 留空保存 = 保持不变；填了 = 全量替换该 provider 的 key 列表。
+function loadKeysIntoEditor(){
+  const n=document.getElementById('k_provider').value;
+  const p=(CFG&&CFG.providers_raw||{})[n]||{};
+  document.getElementById('k_info').innerHTML=
+    `base_url: <b>${p.base_url||'-'}</b> · 当前 ${CFG.providers[n]?.key_count||0} 个 key`+
+    (p.keys_env?` · 从环境变量 <b>${p.keys_env}</b> 读取`:' · 从配置文件读取');
+  document.getElementById('k_keys').value='';   // 不预填，避免泄露
+}
+
+async function saveKeys(){
+  if(!CFG) await refresh();
+  const pname=document.getElementById('k_provider').value;
+  const raw=document.getElementById('k_keys').value;
+  const keys=raw.split('\n').map(s=>s.trim()).filter(Boolean);
+  if(keys.length===0){
+    document.getElementById('k_info').textContent='未填写任何 key，已取消（现有关键字保持不变）';
+    return;
+  }
+  const body=JSON.parse(JSON.stringify({
+    server:CFG.server||{host:"0.0.0.0",port:20200},
+    providers:CFG.providers_raw||{},
+    sharding:CFG.sharding,
+    aggregation:CFG.aggregation,
+    timeouts:CFG.timeouts
+  }));
+  // 覆盖该 provider 的 key；keys_env 置 null，让配置文件直存生效
+  const p=Object.assign({}, body.providers[pname]||{});
+  p.keys=keys;
+  delete p.keys_env;
+  delete p._key_count;
+  body.providers[pname]=p;
+  const out=document.getElementById('k_info');
+  out.textContent='保存中…';
+  const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const d=await r.json();
+  out.textContent=(d.ok?'✅ ':'❌ ')+d.message;
+  document.getElementById('k_keys').value='';
+  refresh();
 }
 
 async function saveConfig(){

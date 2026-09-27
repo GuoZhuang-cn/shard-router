@@ -108,9 +108,27 @@ async def status() -> dict[str, Any]:
             "available": pool.available_count(),
             "keys": pool.snapshot(),
         }
+    def _mask_providers(raw: dict[str, Any]) -> dict[str, Any]:
+        """深拷贝 providers 配置并把明文 keys 换成计数占位。
+
+        /api/status 是 UI 拉的接口，而这个服务裸奔在公网 IP 上（无鉴权）。
+        前端只需要知道「有几个 key、从哪来」，绝不能让完整 key 出现在
+        任何 HTTP 响应里。回写配置时用的是不含 keys 的骨架 + 用户新填的值。
+        """
+        out: dict[str, Any] = {}
+        for name, p in (raw or {}).items():
+            q = dict(p)
+            if "keys" in q:
+                q["keys"] = []
+                q["_key_count"] = len(p.get("keys") or [])
+            if "keys_env" in q and q.get("keys_env"):
+                q["_key_count"] = len(SETTINGS.pools[name]._states) if name in SETTINGS.pools else 0
+            out[name] = q
+        return out
+
     return {
         "providers": providers,
-        "providers_raw": SETTINGS.raw.get("providers") or {},
+        "providers_raw": _mask_providers(SETTINGS.raw.get("providers") or {}),
         "server": SETTINGS.server,
         "sharding": SETTINGS.sharding,
         "aggregation": SETTINGS.aggregation,
@@ -122,20 +140,72 @@ async def status() -> dict[str, Any]:
 
 @app.post("/api/config")
 async def update_config(request: Request) -> JSONResponse:
-    """UI 保存配置：全量替换 config.yaml 后热加载。"""
+    """UI 保存配置。
+
+    **部分更新语义**：请求体里某个 provider 若不含 `keys` 字段，则保留磁盘上
+    已有的 key。这是必要的——前端拿到的 providers_raw 里 keys 已被抹成 []
+    （不能把明文 key 吐给无鉴权的 /api/status），如果整体回写就会静默清空
+    用户填好的 key。只有显式带了 keys（可能为空数组）时才覆盖。
+
+    保存前自动备份 config.yaml 到 config.yaml.bak-<ts>。
+    """
     global SETTINGS, ROUTERS
     body = await request.json()
     try:
+        # 合并：磁盘现值 ← 请求体（per-provider 深合并）
+        cur = yaml.safe_load(open(CONFIG_PATH, encoding="utf-8")) or {}
+        cur = _deep_merge_providers(cur, body)
+
+        import shutil, time as _t
+        bak = f"{CONFIG_PATH}.bak-{int(_t.time())}"
+        shutil.copy2(CONFIG_PATH, bak)
+
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            yaml.safe_dump(body, f, allow_unicode=True, sort_keys=False)
+            yaml.safe_dump(cur, f, allow_unicode=True, sort_keys=False)
+
         new = reload_settings(SETTINGS, CONFIG_PATH)
         SETTINGS = new
         ROUTERS = _build_routers(new)
         for r in ROUTERS.values():
             await r.start()
-        return JSONResponse({"ok": True, "message": "配置已保存并热加载"})
+        return JSONResponse({"ok": True, "message": f"配置已保存并热加载（备份 {bak}）"})
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "message": f"{type(e).__name__}: {e}"}, status_code=400)
+
+
+def _deep_merge_providers(cur: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+    """把请求体合并进磁盘配置。
+
+    providers 段逐字段合并：`keys` 字段只在请求体显式提供时才覆盖，
+    否则保留磁盘现值。其余段（server/sharding/aggregation/timeouts）整体替换。
+    """
+    out = dict(cur)
+    for k, v in (body or {}).items():
+        if k == "providers":
+            merged: dict[str, Any] = {}
+            cur_p = out.get("providers") or {}
+            for name, p in (v or {}).items():
+                base = dict(cur_p.get(name) or {})
+                for pk, pv in (p or {}).items():
+                    if pk == "keys":
+                        # 空数组视为「未提供」而不是「清空」。
+                        # 前端看到的是被抹空的 providers_raw，若把空数组当成显式清空，
+                        # 用户填好的 key 会在下一次「保存配置」时静默丢失。
+                        if pv:
+                            base["keys"] = pv
+                    elif pk == "keys_env" and pv:
+                        base["keys_env"] = pv
+                    else:
+                        base[pk] = pv
+                # 填了直存 keys 就让 keys_env 失效：否则 env 优先，
+                # 用户在 UI 填的 key 会看起来没生效
+                if base.get("keys"):
+                    base["keys_env"] = None
+                merged[name] = base
+            out["providers"] = merged
+        else:
+            out[k] = v
+    return out
 
 
 @app.post("/api/test")
