@@ -35,6 +35,10 @@ class Settings:
         return self.raw.get("timeouts") or {}
 
     @property
+    def retry(self) -> dict[str, Any]:
+        return self.raw.get("retry") or {}
+
+    @property
     def logging(self) -> dict[str, Any]:
         return self.raw.get("logging") or {}
 

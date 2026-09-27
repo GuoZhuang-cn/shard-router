@@ -260,7 +260,8 @@ async function saveKeys(){
     providers:CFG.providers_raw||{},
     sharding:CFG.sharding,
     aggregation:CFG.aggregation,
-    timeouts:CFG.timeouts
+    timeouts:CFG.timeouts,
+    retry:CFG.retry
   }));
   // 覆盖该 provider 的 key；keys_env 置 null，让配置文件直存生效
   const p=Object.assign({}, body.providers[pname]||{});
@@ -295,7 +296,8 @@ async function saveConfig(){
       reduce_model:document.getElementById('s_rmodel').value.trim()||null,
       reduce_mode:document.getElementById('s_rmode').value
     },
-    timeouts:CFG.timeouts
+    timeouts:CFG.timeouts,
+    retry:CFG.retry
   }));
   const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const d=await r.json();
@@ -312,6 +314,12 @@ async function runTest(){
     prompt:document.getElementById('t_prompt').value
   };
   const t0=Date.now();
+  // 撞 429 时后端会等分钟级限流窗口过去（实测 75-100 秒）。
+  // 不显示倒计时的话，页面像卡死了一样。
+  const tick=setInterval(()=>{
+    const s=((Date.now()-t0)/1000).toFixed(0);
+    out.textContent='等待中 '+s+'s…（撞限流时后端会按秒级退避重试，可能要一分多钟）';
+  },1000);
   try{
     const r=await fetch('/api/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const d=await r.json();
@@ -319,6 +327,7 @@ async function runTest(){
     out.textContent=`耗时 ${dt}s\n切片: ${d.sharded} · 估算token: ${d.est_tokens}\n\n`+
       (d.ok? d.reply : ('❌ '+(d.message||d.error)));
   }catch(e){ out.textContent='❌ '+e; }
+  finally{ clearInterval(tick); }
 }
 
 refresh();

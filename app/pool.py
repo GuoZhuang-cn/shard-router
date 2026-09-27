@@ -106,7 +106,7 @@ class KeyPool:
                     return i, s
             return None
 
-    def report(self, index: int, ok: bool, tokens: int = 0) -> None:
+    def report(self, index: int, ok: bool, tokens: int = 0, retry_after: float | None = None) -> None:
         with self._lock:
             s = self._states[index]
             s.total_tokens += tokens
@@ -115,12 +115,25 @@ class KeyPool:
                 s.fail_count = 0
             else:
                 s.fail_count += 1
-                # 指数退避：30 → 60 → 120 → … 封顶 max_cooldown
-                cd = min(
-                    self.cooldown_seconds * (2 ** min(s.fail_count - 1, 5)),
-                    self.max_cooldown_seconds,
-                )
+                if retry_after:
+                    # 上游明确给了 Retry-After 就照办，不用 max_cooldown 砍它
+                    cd = max(0.5, float(retry_after))
+                else:
+                    # 指数退避：30 → 60 → 120 → … 封顶 max_cooldown
+                    cd = min(
+                        self.cooldown_seconds * (2 ** min(s.fail_count - 1, 5)),
+                        self.max_cooldown_seconds,
+                    )
                 s.cooldown_until = time.monotonic() + cd
+
+    def seconds_until_next_available(self) -> float | None:
+        """最快恢复的 key 还要几秒。全可用返回 0，无 key 返回 None。"""
+        if not self._states:
+            return None
+        now = time.monotonic()
+        with self._lock:
+            lefts = [max(0.0, s.cooldown_until - now) for s in self._states]
+        return min(lefts)
 
     async def complete(
         self,
@@ -148,9 +161,17 @@ class KeyPool:
         async with session.post(
             url, json=body, headers=headers, timeout=timeout
         ) as resp:
+            # 上游给了 Retry-After 就照办（SenseNova 目前不给，但要兼容给了的实现）
+            ra = None
+            try:
+                ra_raw = resp.headers.get("Retry-After")
+                if ra_raw:
+                    ra = float(str(ra_raw).strip())
+            except (TypeError, ValueError):
+                ra = None
             raw = await resp.read()
             if resp.status >= 400:
-                raise UpstreamError(resp.status, raw[:400].decode("utf-8", "replace"))
+                raise UpstreamError(resp.status, raw[:400].decode("utf-8", "replace"), retry_after=ra)
             try:
                 data = raw and __import__("json").loads(raw) or {}
             except Exception as e:  # noqa: BLE001
@@ -161,7 +182,8 @@ class KeyPool:
 
 
 class UpstreamError(Exception):
-    def __init__(self, status: int, detail: str) -> None:
+    def __init__(self, status: int, detail: str, retry_after: float | None = None) -> None:
         super().__init__(f"upstream {status}: {detail}")
         self.status = status
         self.detail = detail
+        self.retry_after = retry_after

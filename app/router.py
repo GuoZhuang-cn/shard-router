@@ -58,6 +58,26 @@ class ShardSettings:
 
 
 @dataclass
+class RetrySettings:
+    """单分片的重试参数。
+
+    SenseNova 的 429 是**分钟级** RPM/TPM 限流（账号级
+    `ModelAccountRpmRateLimitExceeded`），所以：
+    - 退避基准必须到秒级（不是亚秒），否则重试必然再撞
+    - 尝试次数要够，让 10 个 key 都有机会被轮到
+    """
+
+    # 单个分片最多尝试几次（每次都会换 key）
+    max_attempts: int = 8
+    # 429 退避基准秒数；实际等待 min(base * 2^attempt, max_backoff)
+    rate_limit_backoff: float = 2.0
+    # 单次退避上限，防止指数增长把客户端挂死
+    max_backoff: float = 30.0
+    # 全冷却时的最大等待秒数（等最快恢复的 key）
+    max_wait_for_key: float = 20.0
+
+
+@dataclass
 class AggSettings:
     mode: str = "stream"
     reduce_enabled: bool = True
@@ -93,12 +113,32 @@ class ShardRouter:
         settings: ShardSettings,
         agg: AggSettings,
         timeouts: dict[str, float],
+        retry: RetrySettings | None = None,
     ) -> None:
         self.pool = pool
         self.settings = settings
         self.agg = agg
         self.timeouts = timeouts
+        self.retry = retry or RetrySettings()
+        self.max_attempts = self.retry.max_attempts
+        self.rate_limit_backoff = self.retry.rate_limit_backoff
         self._session: Any = None
+
+    async def _wait_for_key(self) -> bool:
+        """等最快恢复的 key。返回是否等到了可用的。
+
+        上限 `max_wait_for_key`——超过就放弃，绝不无限挂住客户端。
+        """
+        deadline = time.monotonic() + self.retry.max_wait_for_key
+        while True:
+            left = self.pool.seconds_until_next_available()
+            if left is None:
+                return False
+            if left <= 0:
+                return True
+            if time.monotonic() + left > deadline:
+                return False
+            await asyncio.sleep(min(left + 0.05, 1.0))
 
     async def start(self) -> None:
         import aiohttp
@@ -144,14 +184,23 @@ class ShardRouter:
         body.setdefault("model", model)
 
         last_err = ""
-        for attempt in range(3):
+        for attempt in range(self.max_attempts):
             got = self.pool.acquire()
             if got is None:
-                # 全冷却：等最短的那个恢复
-                await asyncio.sleep(2.0)
+                # 全冷却：等到最快恢复的那个 key，而不是拍 2 秒。
+                # 上游 429 是分钟级 RPM/TPM，2 秒远远不够，白等。
+                waited = await self._wait_for_key()
+                if not waited:
+                    return ShardResult(
+                        shard.index, False,
+                        error=f"all keys cooling ({last_err})", tokens=shard.tokens,
+                    )
                 got = self.pool.acquire()
                 if got is None:
-                    return ShardResult(shard.index, False, error="all keys cooling", tokens=shard.tokens)
+                    return ShardResult(
+                        shard.index, False,
+                        error=f"all keys cooling ({last_err})", tokens=shard.tokens,
+                    )
             idx, st = got
             t0 = time.monotonic()
             try:
@@ -169,13 +218,21 @@ class ShardRouter:
                     latency=round(lat, 2), key_tail=st.key[-6:],
                 )
             except UpstreamError as e:
-                self.pool.report(idx, False)
+                self.pool.report(idx, False, retry_after=e.retry_after)
                 last_err = f"{e.status}: {e.detail[:120]}"
-                await asyncio.sleep(0.5 * (attempt + 1))
+                # 429 用秒级指数退避（分钟级限流）；其他错误短退避即可
+                base = self.rate_limit_backoff if e.status == 429 else 1.0
+                # 上游明确给了 Retry-After 就照办，绝不用自己的封顶砍它——
+                # 砍半只会让重试再撞同一堵墙。只有上游没说才用指数退避。
+                if e.retry_after is not None:
+                    wait = max(0.5, float(e.retry_after))
+                else:
+                    wait = min(base * (2 ** attempt), self.retry.max_backoff)
+                await asyncio.sleep(wait)
             except asyncio.TimeoutError:
                 self.pool.report(idx, False)
                 last_err = "timeout"
-                await asyncio.sleep(0.5 * (attempt + 1))
+                await asyncio.sleep(min(1.0 * (2 ** attempt), 15.0))
             except Exception as e:  # noqa: BLE001
                 self.pool.report(idx, False)
                 last_err = f"{type(e).__name__}: {e}"[:160]

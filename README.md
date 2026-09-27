@@ -183,6 +183,12 @@ OpenAI 响应结构。
 5. **顺序推理仍不适用**：tree reduce 改善了汇总质量，但「先读第 3 章再
    据此改写第 7 章」这类任务必须用串行 Refine（放弃并行）。
    当前未实现 Refine 模式，需要时再加。
+6. **撞 429 会等几十秒甚至一分多钟**：SenseNova 的 429 是**账号级**
+   (`ModelAccountRpmRateLimitExceeded`) 的分钟级 RPM/TPM 限流，且响应
+   不带 `Retry-After`。此时 10 个 key 撞的是同一个窗口，轮询换 key 救不了，
+   只能等窗口过去。`retry.rate_limit_backoff` 控制等待节奏（默认 2s 起、
+   指数增长、封顶 `retry.max_backoff`），实测一次成功可能要 75-100 秒。
+   这是分钟级限流的物理下限，不是实现缺陷。
 
 ## 文件
 

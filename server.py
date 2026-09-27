@@ -28,7 +28,7 @@ sys.path.insert(0, str(BASE))
 
 from app.config import Settings, load, reload as reload_settings  # noqa: E402
 from app.pool import KeyPool, UpstreamError  # noqa: E402
-from app.router import AggSettings, ShardRouter, ShardSettings  # noqa: E402
+from app.router import AggSettings, RetrySettings, ShardRouter, ShardSettings  # noqa: E402
 
 CONFIG_PATH = os.environ.get("SHARD_ROUTER_CONFIG", str(BASE / "config.yaml"))
 
@@ -55,6 +55,7 @@ def _build_routers(st: Settings) -> dict[str, ShardRouter]:
     out: dict[str, ShardRouter] = {}
     sh = st.sharding or {}
     ag = st.aggregation or {}
+    rt = st.retry or {}
     for name, pool in st.pools.items():
         out[name] = ShardRouter(
             pool=pool,
@@ -72,6 +73,12 @@ def _build_routers(st: Settings) -> dict[str, ShardRouter]:
                 reduce_mode=ag.get("reduce_mode", "flat"),
             ),
             timeouts=st.timeouts,
+            retry=RetrySettings(
+                max_attempts=int(rt.get("max_attempts", 8)),
+                rate_limit_backoff=float(rt.get("rate_limit_backoff", 2.0)),
+                max_backoff=float(rt.get("max_backoff", 30.0)),
+                max_wait_for_key=float(rt.get("max_wait_for_key", 20.0)),
+            ),
         )
     return out
 
@@ -133,6 +140,7 @@ async def status() -> dict[str, Any]:
         "sharding": SETTINGS.sharding,
         "aggregation": SETTINGS.aggregation,
         "timeouts": SETTINGS.timeouts,
+        "retry": SETTINGS.retry,
         "stats": STATS,
         "config_path": CONFIG_PATH,
     }
@@ -234,6 +242,27 @@ async def test_provider(request: Request) -> JSONResponse:
         })
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "message": f"{type(e).__name__}: {e}"}, status_code=500)
+
+
+@app.get("/v1/models")
+async def list_models() -> dict[str, Any]:
+    """OpenAI 兼容的模型列表。
+
+    9router 把这个服务当 provider 探测时会打这个端点；没有它就报 404，
+    provider 加不进来。按所有 provider 的 models 去重汇总。
+    """
+    seen: dict[str, str] = {}
+    for r in ROUTERS.values():
+        owner = r.pool.cfg.name
+        for m in (r.pool.cfg.models or []):
+            seen.setdefault(m, owner)
+    return {
+        "object": "list",
+        "data": [
+            {"id": m, "object": "model", "created": int(time.time()), "owned_by": owner}
+            for m, owner in sorted(seen.items())
+        ],
+    }
 
 
 def _pick_router(model: str) -> ShardRouter | None:

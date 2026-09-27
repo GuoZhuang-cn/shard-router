@@ -16,7 +16,7 @@ BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 
 from app.pool import KeyPool, ProviderConfig, UpstreamError  # noqa: E402
-from app.router import AggSettings, ShardRouter, ShardSettings, _extract_text  # noqa: E402
+from app.router import AggSettings, RetrySettings, ShardRouter, ShardSettings, _extract_text  # noqa: E402
 from app.shard import Shard, estimate_tokens, messages_tokens, split_messages  # noqa: E402
 
 
@@ -636,6 +636,171 @@ async def test_reduce_can_use_separate_model():
     out = await r.run({"messages": _mk(turns=40, size=600)}, "other-model")
     assert "error" not in out
     assert "other-model" in seen_models
+
+
+# ---------- 429 重试（SenseNova 分钟级 RPM/TPM） ----------
+
+@pytest.mark.asyncio
+async def test_429_retries_until_recovers(monkeypatch):
+    """连续 429 几次后成功：必须换 key 重试而不是立刻失败。"""
+    r = _router(threshold=100000)
+    slept: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def spy_sleep(d, *a, **k):
+        slept.append(d)
+        return await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", spy_sleep)
+    n = {"i": 0}
+
+    async def fake_complete(session, idx, body, ct, rt):
+        n["i"] += 1
+        if n["i"] <= 3:
+            raise UpstreamError(429, "inference exceeds tpm/rpm limit")
+        return {"choices": [{"message": {"content": "恢复成功"}}], "usage": {}}
+
+    r.pool.complete = fake_complete  # type: ignore[method-assign]
+    out = await r.run({"messages": [{"role": "user", "content": "hi"}]}, "kimi-k3")
+    assert "error" not in out, out
+    assert out["choices"][0]["message"]["content"] == "恢复成功"
+    assert n["i"] == 4, "应重试到第 4 次才成功"
+    assert slept, "429 重试应有退避"
+
+
+@pytest.mark.asyncio
+async def test_429_backoff_is_seconds_not_subsecond(monkeypatch):
+    """分钟级限流：429 的等待必须是秒级，亚秒退避毫无意义。"""
+    r = _router(threshold=100000)
+    slept: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def spy_sleep(d, *a, **k):
+        slept.append(d)
+        return await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", spy_sleep)
+    n = {"i": 0}
+
+    async def fake_complete(session, idx, body, ct, rt):
+        n["i"] += 1
+        if n["i"] <= 2:
+            raise UpstreamError(429, "rpm exceeded")
+        return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+
+    r.pool.complete = fake_complete  # type: ignore[method-assign]
+    out = await r.run({"messages": [{"role": "user", "content": "hi"}]}, "kimi-k3")
+    assert "error" not in out
+    assert slept, "429 后应当退避等待"
+    assert slept[0] >= 2.0, f"429 退避太短: {slept[0]}s，分钟级限流下必然再撞"
+    # 指数增长
+    assert slept[1] > slept[0], "429 退避应指数增长"
+
+
+@pytest.mark.asyncio
+async def test_429_uses_retry_after_when_provided(monkeypatch):
+    """上游给了 Retry-After 就照它等待和冷却，不被自己的封顶砍。"""
+    r = _router(threshold=100000)
+    slept: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def spy_sleep(d, *a, **k):
+        slept.append(d)
+        return await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", spy_sleep)
+    n = {"i": 0}
+
+    async def fake_complete(session, idx, body, ct, rt):
+        n["i"] += 1
+        if n["i"] == 1:
+            raise UpstreamError(429, "slow down", retry_after=60.0)
+        return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+
+    r.pool.complete = fake_complete  # type: ignore[method-assign]
+    await r.run({"messages": [{"role": "user", "content": "hi"}]}, "m")
+    # 等待时长必须等于 Retry-After，不能被 max_backoff 砍半
+    assert slept and slept[0] >= 60.0, f"未照 Retry-After 等待: {slept}"
+    # report(retry_after=60) 应把冷却设到 ~60s（不被 max_cooldown 砍）
+    left = r.pool._states[0].cooldown_until - __import__("time").monotonic()
+    assert left >= 50.0, f"未按 Retry-After 冷却，只剩 {left:.1f}s"
+
+
+@pytest.mark.asyncio
+async def test_all_cooling_error_includes_last_reason(monkeypatch):
+    """全冷却时报错要带上最后一次失败原因，方便定位。"""
+    r = _router(threshold=100000)
+
+    async def noop(d, *a, **k):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", noop)
+
+    async def fake_complete(session, idx, body, ct, rt):
+        raise UpstreamError(429, "ModelAccountRpmRateLimitExceeded")
+
+    r.pool.complete = fake_complete  # type: ignore[method-assign]
+    out = await r.run({"messages": [{"role": "user", "content": "hi"}]}, "m")
+    assert "error" in out
+    assert "429" in out["error"]["message"]
+    assert "RpmRateLimit" in out["error"]["message"] or "429" in out["error"]["message"]
+
+
+def test_seconds_until_next_available_reports_soonest():
+    from app.pool import KeyPool, ProviderConfig
+
+    p = KeyPool(ProviderConfig("t", "http://x/v1", ["k0", "k1", "k2"]))
+    assert p.seconds_until_next_available() == 0.0
+    p.report(0, False)   # 冷却 30s
+    p.report(1, False)   # 冷却 30s
+    p.report(2, False)   # 冷却 30s
+    left = p.seconds_until_next_available()
+    assert left is not None and 25.0 < left <= 30.0
+
+
+def test_wait_for_key_respects_deadline(monkeypatch):
+    """全冷却且恢复时间超过预算时必须放弃，不挂死。"""
+    import time as _t
+    from app.pool import KeyPool, ProviderConfig
+
+    async def noop(d, *a, **k):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", noop)
+
+    pool = KeyPool(ProviderConfig("t", "http://x/v1", ["k"]), cooldown_seconds=120.0)
+    r = ShardRouter(pool, ShardSettings(), AggSettings(), {"connect": 5, "read": 10},
+                    RetrySettings(max_wait_for_key=1.0))
+    pool.report(0, False)  # 冷却 120s，远超 1s 预算
+
+    t0 = _t.monotonic()
+    ok = asyncio.run(r._wait_for_key())
+    dt = _t.monotonic() - t0
+    assert ok is False, "恢复时间超过预算应放弃"
+    assert dt <= 3.0, f"等待过久 {dt:.1f}s"
+
+
+# ---------- /v1/models ----------
+
+@pytest.mark.asyncio
+async def test_models_endpoint_lists_configured_models():
+    """9router 探测 provider 会打 /v1/models，没有就 404，provider 加不进来。"""
+    r = _router(threshold=100000)
+    r.pool.cfg.models = ["kimi-k3", "deepseek-flash"]
+    r2 = _router(threshold=100000)
+    r2.pool.cfg.models = ["glm-5.2"]
+    import server as srv
+    srv.ROUTERS = {"a": r, "b": r2}
+    try:
+        d = await srv.list_models()
+        ids = {m["id"] for m in d["data"]}
+        assert ids == {"kimi-k3", "deepseek-flash", "glm-5.2"}
+        assert d["object"] == "list"
+        for m in d["data"]:
+            assert m["object"] == "model"
+            assert "owned_by" in m
+    finally:
+        srv.ROUTERS = {}
 
 
 @pytest.mark.asyncio
